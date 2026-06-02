@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  servesmb:
+    build: .
+    image: servesmb:latest
+    container_name: servesmb
+    ports:
+      - "445:445"
+      - "8445:8445" # Alternative port for testing
+    volumes:
+      - ./shares:/app/shares
+      - ./config:/app/config
+    environment:
+      - SMB_DEBUG=0
+      - SMB_TRACE=0
+    restart: unless-stopped
+    networks:
+      - smb_network
+
+  # Development version with custom config
+  servesmb-dev:
+    build: .
+    image: servesmb:latest
+    container_name: servesmb-dev
+    ports:
+      - "8445:8445"
+    volumes:
+      - ./dev-shares:/app/shares
+      - ./dev-config.json:/app/config/config.json
+    environment:
+      - SMB_DEBUG=1
+      - SMB_TRACE=1
+    command: [ "./servesmb", "-config", "/app/config/config.json", "-port", "8445" ]
+    restart: unless-stopped
+    networks:
+      - smb_network
+    profiles:
+      - dev
+
+  # Test environment
+  servesmb-test:
+    build: .
+    image: servesmb:latest
+    container_name: servesmb-test
+    ports:
+      - "8446:8446"
+    volumes:
+      - ./test-shares:/app/shares
+    environment:
+      - SMB_DEBUG=1
+    command: [ "./servesmb", "-port", "8446", "-domain", "TESTDOMAIN", "-server", "TESTSERVER", "-shares", "/app/shares" ]
+    restart: "no"
+    networks:
+      - smb_network
+    profiles:
+      - test
+
+networks:
+  smb_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  smb_shares:
+    driver: local

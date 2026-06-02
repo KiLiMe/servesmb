@@ -1,0 +1,42 @@
+{
+  "listen_address": "0.0.0.0",
+  "port": 445,
+  "shares_path": "./shares",
+  "domain": "WORKGROUP",
+  "server_name": "MY-SMB-SERVER",
+  "enable_smb1": true,
+  "enable_smb2": true,
+  "enable_smb3": true,
+  "users": {
+    "guest": "",
+    "testuser": "testpass",
+    "admin": "adminpass",
+    "developer": "devpass123"
+  },
+  "shares": [
+    {
+      "name": "PUBLIC",
+      "path": "public",
+      "comment": "Public file share",
+      "readonly": false,
+      "guest_access": true,
+      "hidden": false
+    },
+    {
+      "name": "PRIVATE",
+      "path": "private",
+      "comment": "Private file share",
+      "readonly": false,
+      "guest_access": false,
+      "hidden": false
+    },
+    {
+      "name": "READONLY",
+      "path": "readonly",
+      "comment": "Read-only share",
+      "readonly": true,
+      "guest_access": true,
+      "hidden": false
+    }
+  ]
+}

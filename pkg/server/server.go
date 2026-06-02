@@ -1,0 +1,538 @@
+package server
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/3xport/servesmb/pkg/auth"
+	"github.com/3xport/servesmb/pkg/hooks"
+	"github.com/3xport/servesmb/pkg/mdns"
+	"github.com/3xport/servesmb/pkg/netbios"
+	"github.com/3xport/servesmb/pkg/protocol"
+	"github.com/3xport/servesmb/pkg/shares"
+	"github.com/3xport/servesmb/pkg/smb1"
+	"github.com/3xport/servesmb/pkg/smb2"
+	"github.com/3xport/servesmb/pkg/smb3"
+)
+
+type AuthConfig struct {
+	Password string
+	NTHash   []byte
+}
+
+type Config struct {
+	ListenAddress   string
+	Port            int
+	SharesPath      string
+	Domain          string
+	ServerName      string
+	EnableSMB1      bool
+	EnableSMB2      bool
+	EnableSMB3      bool
+	EnableNetBIOS   bool
+	NetBIOSPort     int
+	EnableMDNS      bool                  // Advertise server/shares via mDNS / DNS-SD (Bonjour)
+	Users           map[string]AuthConfig // username -> config
+	Debug           int                   // 0..10
+	LogHash         bool                  // Log NTLMv2 hashes
+	StaticChallenge string                // Static 16-char hex challenge
+	EnableMIC       bool                  // Enable NTLM MIC request (default false for compatibility)
+	NativeOS        string                // Custom Native OS string
+	NativeLanMan    string                // Custom Native LanMan string
+	DefinedShares   []*protocol.Share     // Explicitly defined shares from config
+	ShareManager    *shares.ShareManager  // Custom ShareManager (optional)
+	Hooks           hooks.EventHooks      // Optional event hooks
+}
+
+func DefaultConfig() *Config {
+	return &Config{
+		ListenAddress:   "0.0.0.0",
+		Port:            protocol.SMB_PORT,
+		SharesPath:      "./shares",
+		Domain:          "WORKGROUP",
+		ServerName:      "SMB-SERVER",
+		EnableSMB1:      true,
+		EnableSMB2:      true,
+		EnableSMB3:      true,
+		EnableNetBIOS:   true,
+		NetBIOSPort:     protocol.NETBIOS_PORT,
+		Users:           make(map[string]AuthConfig), // No default users
+		LogHash:         false,
+		StaticChallenge: "",
+		EnableMIC:       false,
+		NativeOS:        "Go SMB Server",
+		NativeLanMan:    "Go SMB",
+		Hooks:           &hooks.NoOpEventHooks{},
+	}
+}
+
+type SMBServer struct {
+	config         *Config
+	shareManager   *shares.ShareManager
+	authenticator  *auth.NTLMAuthenticator
+	smb1Handler    *smb1.SMB1Handler
+	smb2Handler    *smb2.SMB2Handler
+	smb3Handler    *smb3.SMB3Handler
+	listener       net.Listener
+	netbiosNS      *netbios.NameService
+	netbiosSession *netbios.SessionService
+	mdnsResponder  *mdns.Responder
+	running        bool
+}
+
+func NewSMBServer(config *Config) (*SMBServer, error) {
+	if config == nil {
+		config = DefaultConfig()
+	}
+	// Ensure hooks are set to prevent nil pointer checks everywhere
+	if config.Hooks == nil {
+		config.Hooks = &hooks.NoOpEventHooks{}
+	}
+
+	// Create shares directory if it doesn't exist and path is specified
+	// Only if we are creating a default ShareManager or if SharesPath is relevant
+	if config.ShareManager == nil && config.SharesPath != "" {
+		if err := os.MkdirAll(config.SharesPath, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create shares directory: %v", err)
+		}
+	}
+
+	// Initialize components
+	var shareManager *shares.ShareManager
+	if config.ShareManager != nil {
+		shareManager = config.ShareManager
+	} else {
+		shareManager = shares.NewShareManager(config.SharesPath)
+	}
+	authenticator := auth.NewNTLMAuthenticator(config.Domain, config.ServerName)
+
+	// Add users to authenticator
+	for username, userConfig := range config.Users {
+		if userConfig.NTHash != nil {
+			authenticator.AddUserWithHash(username, userConfig.NTHash)
+		} else {
+			authenticator.AddUser(username, userConfig.Password)
+		}
+	}
+
+	// Configure Authentication Options
+	if config.LogHash {
+		authenticator.SetLogHash(true)
+	}
+	if config.StaticChallenge != "" {
+		authenticator.SetStaticChallenge(config.StaticChallenge)
+	}
+
+	// Add default shares
+	if err := shareManager.AddDefaultShares(); err != nil {
+		return nil, fmt.Errorf("failed to add default shares: %v", err)
+	}
+
+	// Auto-discover shares from SharesPath
+	if config.SharesPath != "" && shareManager != nil {
+		entries, err := os.ReadDir(config.SharesPath)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					name := entry.Name()
+					share := &protocol.Share{
+						Name:        name,
+						Path:        name, // Relative to SharesPath
+						Comment:     "Auto-exported share",
+						ReadOnly:    false,
+						GuestAccess: true, // Auto-exported are guest accessible by default? Or stricter?
+						// For servesmb, usually we want easy access unless configured otherwise.
+					}
+					shareManager.AddShare(share)
+				}
+			}
+		}
+	}
+
+	server := &SMBServer{
+		config:        config,
+		shareManager:  shareManager,
+		authenticator: authenticator,
+	}
+
+	// Initialize protocol handlers
+	if config.EnableSMB1 {
+		server.smb1Handler = smb1.NewSMB1Handler(shareManager, authenticator, config.NativeOS, config.NativeLanMan)
+	}
+	if config.EnableSMB2 {
+		server.smb2Handler = smb2.NewSMB2Handler(shareManager, authenticator, false, config.Debug, config.EnableMIC, config.Hooks)
+	}
+	if config.EnableSMB3 {
+		server.smb3Handler = smb3.NewSMB3Handler(shareManager, authenticator, config.Debug, config.EnableMIC, config.Hooks)
+	}
+
+	// Initialize NetBIOS services if enabled
+	if config.EnableNetBIOS {
+		localIP := netbios.GetLocalIPAddress()
+		server.netbiosNS = netbios.NewNameService(config.ServerName, config.Domain, localIP)
+
+		// Use SMB3 handler as default for NetBIOS sessions, fall back to SMB2, then SMB1
+		var netbiosHandler netbios.SMBHandler
+		if server.smb3Handler != nil {
+			netbiosHandler = server.smb3Handler
+		} else if server.smb2Handler != nil {
+			netbiosHandler = server.smb2Handler
+		} else if server.smb1Handler != nil {
+			netbiosHandler = server.smb1Handler
+		}
+
+		if netbiosHandler != nil {
+			server.netbiosSession = netbios.NewSessionService(config.ServerName, config.Domain, config.NetBIOSPort, netbiosHandler)
+		}
+	}
+
+	return server, nil
+}
+
+func (s *SMBServer) AddShare(share *protocol.Share) error {
+	return s.shareManager.AddShare(share)
+}
+
+func (s *SMBServer) AddUser(username, password string) {
+	s.authenticator.AddUser(username, password)
+	s.config.Users[username] = AuthConfig{Password: password}
+}
+
+func (s *SMBServer) AddUserWithHash(username string, ntHash []byte) {
+	s.authenticator.AddUserWithHash(username, ntHash)
+	s.config.Users[username] = AuthConfig{NTHash: ntHash}
+}
+
+func (s *SMBServer) Start() error {
+	address := fmt.Sprintf("%s:%d", s.config.ListenAddress, s.config.Port)
+
+	var err error
+	s.listener, err = net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %v", address, err)
+	}
+
+	s.running = true
+
+	log.Printf("SMB Server starting on %s", address)
+	log.Printf("Supported protocols: SMB1=%v, SMB2=%v, SMB3=%v, NetBIOS=%v",
+		s.config.EnableSMB1, s.config.EnableSMB2, s.config.EnableSMB3, s.config.EnableNetBIOS)
+	log.Printf("Shares path: %s", s.config.SharesPath)
+
+	// Start NetBIOS services
+	if s.config.EnableNetBIOS {
+		if s.netbiosNS != nil {
+			err := s.netbiosNS.Start()
+			if err != nil {
+				log.Printf("Warning: Failed to start NetBIOS Name Service: %v", err)
+			}
+		}
+		if s.netbiosSession != nil {
+			err := s.netbiosSession.Start()
+			if err != nil {
+				log.Printf("Warning: Failed to start NetBIOS Session Service: %v", err)
+			}
+		}
+	}
+
+	// List available shares
+	shares := s.shareManager.ListShares()
+	log.Printf("Available shares:")
+	for _, share := range shares {
+		log.Printf("  - %s: %s (%s)", share.Name, share.Comment,
+			filepath.Join(s.config.SharesPath, share.Path))
+	}
+
+	// Advertise over mDNS / DNS-SD if enabled. Shares are registered before
+	// Start() is called, so the share list (and Time Machine flags) is final.
+	if s.config.EnableMDNS {
+		var infos []mdns.ShareInfo
+		for _, share := range shares {
+			if share.Name == "IPC$" {
+				continue
+			}
+			infos = append(infos, mdns.ShareInfo{Name: share.Name, TimeMachine: share.IsTimeMachine()})
+		}
+		s.mdnsResponder = mdns.New(s.config.ServerName, s.config.Port, localIPv4s(), infos, s.config.Debug)
+		if err := s.mdnsResponder.Start(); err != nil {
+			log.Printf("Warning: Failed to start mDNS advertisement: %v", err)
+			s.mdnsResponder = nil
+		}
+	}
+
+	for s.running {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			if s.running {
+				log.Printf("Error accepting connection: %v", err)
+			}
+			continue
+		}
+
+		log.Printf("New connection from %s", conn.RemoteAddr())
+		go s.handleConnection(conn)
+	}
+
+	return nil
+}
+
+func (s *SMBServer) Stop() error {
+	s.running = false
+
+	// Stop NetBIOS services
+	if s.netbiosNS != nil {
+		s.netbiosNS.Stop()
+	}
+	if s.netbiosSession != nil {
+		s.netbiosSession.Stop()
+	}
+
+	// Stop mDNS advertisement
+	if s.mdnsResponder != nil {
+		s.mdnsResponder.Stop()
+	}
+
+	if s.listener != nil {
+		return s.listener.Close()
+	}
+	return nil
+}
+
+// localIPv4s returns the host's non-loopback, non-link-local IPv4 addresses for
+// advertising in mDNS A records.
+func localIPv4s() []net.IP {
+	var ips []net.IP
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ips
+	}
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		ip4 := ip.To4()
+		if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+			continue
+		}
+		ips = append(ips, ip4)
+	}
+	return ips
+}
+
+func (s *SMBServer) handleConnection(conn net.Conn) {
+	defer conn.Close()
+
+	// Set connection timeout
+	conn.SetReadDeadline(time.Now().Add(protocol.DEFAULT_TIMEOUT))
+
+	// Detect protocol version by reading the first message and wrap the
+	// connection so handlers can re-read the already consumed bytes.
+	protocolVersion, wrappedConn, err := s.detectProtocol(conn)
+	if err != nil {
+		log.Printf("Failed to detect protocol for %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	log.Printf("Detected protocol %s for %s", protocolVersion, conn.RemoteAddr())
+
+	// Route to appropriate handler
+	var handler protocol.SMBHandler
+
+	switch protocolVersion {
+	case "SMB1":
+		if !s.config.EnableSMB1 || s.smb1Handler == nil {
+			log.Printf("SMB1 not enabled, rejecting connection from %s", conn.RemoteAddr())
+			return
+		}
+		handler = s.smb1Handler
+	case "SMB2":
+		if !s.config.EnableSMB2 || s.smb2Handler == nil {
+			log.Printf("SMB2 not enabled, rejecting connection from %s", conn.RemoteAddr())
+			return
+		}
+		handler = s.smb2Handler
+	case "SMB3":
+		if !s.config.EnableSMB3 || s.smb3Handler == nil {
+			log.Printf("SMB3 not enabled, rejecting connection from %s", conn.RemoteAddr())
+			return
+		}
+		handler = s.smb3Handler
+	default:
+		log.Printf("Unsupported protocol %s from %s", protocolVersion, conn.RemoteAddr())
+		return
+	}
+
+	// Clear read deadline; let protocol handlers manage their own timeouts
+	conn.SetReadDeadline(time.Time{})
+	// Handle the connection with the appropriate handler using the wrapped conn
+	// which feeds back the initial negotiate bytes to the handler.
+	if wrappedConn != nil {
+		conn = wrappedConn
+	}
+	err = handler.HandleConnection(conn)
+	if err != nil && err != io.EOF {
+		log.Printf("Error handling %s connection from %s: %v",
+			protocolVersion, conn.RemoteAddr(), err)
+	} else {
+		log.Printf("Connection from %s closed gracefully", conn.RemoteAddr())
+	}
+}
+
+func (s *SMBServer) detectProtocol(conn net.Conn) (string, net.Conn, error) {
+	// Read NetBIOS header (4 bytes)
+	nbHeader := make([]byte, 4)
+	_, err := io.ReadFull(conn, nbHeader)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to read NetBIOS header: %v", err)
+	}
+
+	// Extract message length
+	msgLen := uint32(nbHeader[1])<<16 | uint32(nbHeader[2])<<8 | uint32(nbHeader[3])
+	if msgLen > protocol.MAX_BUFFER_SIZE || msgLen < 4 {
+		return "", nil, fmt.Errorf("invalid message length: %d", msgLen)
+	}
+
+	// Read first 4 bytes of SMB message to detect protocol
+	protocolID := make([]byte, 4)
+	_, err = io.ReadFull(conn, protocolID)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to read protocol ID: %v", err)
+	}
+
+	// Read rest of message to avoid breaking the stream
+	remaining := make([]byte, msgLen-4)
+	_, err = io.ReadFull(conn, remaining)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to read remaining message: %v", err)
+	}
+
+	// Reconstruct full message and create a new connection wrapper
+	fullMessage := make([]byte, 4+msgLen)
+	copy(fullMessage[0:4], nbHeader)
+	copy(fullMessage[4:8], protocolID)
+	copy(fullMessage[8:], remaining)
+
+	// Create a buffered connection that includes the read data
+	bufferedConn := &bufferedConnection{
+		Conn:   conn,
+		buffer: fullMessage,
+		offset: 0,
+	}
+
+	// Detect protocol based on signature
+	protocolStr := string(protocolID)
+	switch protocolStr {
+	case protocol.SMB1_PROTOCOL_ID:
+		// Peek inside SMB1 negotiate to see if client proposes SMB2 dialects.
+		// SMB1 header is 32 bytes; dialect strings are in Data after Parameters.
+		if len(fullMessage) >= 36 {
+			// Search for ASCII substrings indicating SMB2-capable client
+			if bytes.Contains(fullMessage, []byte("SMB 2.002")) ||
+				bytes.Contains(fullMessage, []byte("SMB 2.1")) ||
+				bytes.Contains(fullMessage, []byte("SMB 3.")) {
+				// Reply with SMB2 NEGOTIATE. Use the handler that will
+				// actually process the connection so dialect state is shared.
+				if s.smb3Handler != nil {
+					resp := s.smb3Handler.BuildNegotiateResponseBytes()
+					if len(resp) > 0 {
+						conn.Write(resp)
+						return "SMB3", conn, nil
+					}
+				} else if s.smb2Handler != nil {
+					resp := s.smb2Handler.BuildNegotiateResponseBytes()
+					if len(resp) > 0 {
+						conn.Write(resp)
+						return "SMB2", conn, nil
+					}
+				}
+			}
+		}
+		return "SMB1", bufferedConn, nil
+	case protocol.SMB2_PROTOCOL_ID:
+		// For SMB2/SMB3, we need to look at the negotiate request to determine exact version
+		// For now, default to SMB2, the handler will negotiate the exact version
+		if s.config.EnableSMB3 {
+			return "SMB3", bufferedConn, nil // SMB3 handler supports both SMB2 and SMB3
+		}
+		return "SMB2", bufferedConn, nil
+	default:
+		return "", nil, fmt.Errorf("unknown protocol signature: %x", protocolID)
+	}
+}
+
+// bufferedConnection wraps a connection with a buffer for already-read data
+type bufferedConnection struct {
+	net.Conn
+	buffer []byte
+	offset int
+}
+
+func (bc *bufferedConnection) Read(p []byte) (int, error) {
+	// First, serve data from buffer
+	if bc.offset < len(bc.buffer) {
+		n := copy(p, bc.buffer[bc.offset:])
+		bc.offset += n
+		return n, nil
+	}
+
+	// Buffer is exhausted, read from underlying connection
+	return bc.Conn.Read(p)
+}
+
+func (s *SMBServer) IsRunning() bool {
+	return s.running
+}
+
+func (s *SMBServer) GetConfig() *Config {
+	return s.config
+}
+
+func (s *SMBServer) GetShareManager() *shares.ShareManager {
+	return s.shareManager
+}
+
+func (s *SMBServer) GetStats() map[string]interface{} {
+	stats := make(map[string]interface{})
+
+	stats["running"] = s.running
+	stats["listen_address"] = s.config.ListenAddress
+	stats["port"] = s.config.Port
+	stats["domain"] = s.config.Domain
+	stats["server_name"] = s.config.ServerName
+
+	// Protocol support
+	protocols := make(map[string]bool)
+	protocols["SMB1"] = s.config.EnableSMB1
+	protocols["SMB2"] = s.config.EnableSMB2
+	protocols["SMB3"] = s.config.EnableSMB3
+	stats["protocols"] = protocols
+
+	// Share information
+	shares := s.shareManager.ListShares()
+	shareInfo := make([]map[string]interface{}, len(shares))
+	for i, share := range shares {
+		shareInfo[i] = map[string]interface{}{
+			"name":         share.Name,
+			"path":         share.Path,
+			"comment":      share.Comment,
+			"readonly":     share.ReadOnly,
+			"guest_access": share.GuestAccess,
+		}
+	}
+	stats["shares"] = shareInfo
+
+	// User count
+	stats["user_count"] = len(s.config.Users)
+
+	return stats
+}
