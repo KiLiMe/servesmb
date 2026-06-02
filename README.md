@@ -217,12 +217,6 @@ clients see the share's real free/total disk space.
   **SMB1, SMB2.0.2, SMB2.1, SMB3.0 and SMB3.1.1**: share enumeration, directory
   listing, upload, download (with checksum verify), mkdir/rmdir, delete,
   guest→auth-share denial, and read-only write denial — 70/70 checks pass.
-- **Note on SMB3 + impacket:** impacket's own `SMB3.create()` raises
-  `UnboundLocalError: parentDir` for root-level files when the server advertises
-  SMB3 directory leasing (a client-side bug at `smb3.py:1211`, present in both
-  0.11.0 and 0.13.1). Real clients (Windows, macOS, Linux cifs) are unaffected.
-  The server's SMB3 path is correct — confirmed by clearing the client's
-  `SupportsDirectoryLeasing` flag, after which all SMB3 operations pass.
 
 ## Architecture
 
