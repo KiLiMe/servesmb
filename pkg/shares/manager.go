@@ -5,22 +5,38 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/3xport/servesmb/pkg/protocol"
 	"github.com/spf13/afero"
 )
 
+// diskFreeTTL is how long a DiskFree result is reused before calling statfs(2)
+// again. Time Machine polls free space every 1-3 s; 30 s keeps the answer fresh
+// enough while cutting ~15 statfs syscalls per write-burst cycle down to one.
+const diskFreeTTL = 30 * time.Second
+
+type diskFreeCacheEntry struct {
+	free, total uint64
+	at          time.Time
+}
+
 type ShareManager struct {
 	shares      map[string]*protocol.Share
 	filesystems map[string]afero.Fs
 	basePath    string
+
+	diskFreeMu    sync.Mutex
+	diskFreeCache map[string]diskFreeCacheEntry
 }
 
 func NewShareManager(basePath string) *ShareManager {
 	return &ShareManager{
-		shares:      make(map[string]*protocol.Share),
-		filesystems: make(map[string]afero.Fs),
-		basePath:    basePath,
+		shares:        make(map[string]*protocol.Share),
+		filesystems:   make(map[string]afero.Fs),
+		basePath:      basePath,
+		diskFreeCache: make(map[string]diskFreeCacheEntry),
 	}
 }
 
@@ -64,16 +80,32 @@ func (sm *ShareManager) ListShares() []*protocol.Share {
 // the volume backing the named share, computed from the same path AddShare
 // grounds the share's filesystem on. ok is false when it can't be determined
 // (e.g. the IPC$ in-memory share), so callers can fall back to a default.
+// Results are cached for diskFreeTTL to avoid a statfs(2) syscall on every
+// QUERY_INFO FileFsSizeInformation request (macOS polls this every 1-3 s).
 func (sm *ShareManager) DiskFree(shareName string) (free, total uint64, ok bool) {
 	share, err := sm.GetShare(shareName)
 	if err != nil || share == nil {
 		return 0, 0, false
 	}
+
+	key := strings.ToUpper(shareName)
+	sm.diskFreeMu.Lock()
+	if e, hit := sm.diskFreeCache[key]; hit && time.Since(e.at) < diskFreeTTL {
+		sm.diskFreeMu.Unlock()
+		return e.free, e.total, true
+	}
+	sm.diskFreeMu.Unlock()
+
 	fullPath := filepath.Join(sm.basePath, share.Path)
 	free, total, err = diskFreeTotal(fullPath)
 	if err != nil || total == 0 {
 		return 0, 0, false
 	}
+
+	sm.diskFreeMu.Lock()
+	sm.diskFreeCache[key] = diskFreeCacheEntry{free: free, total: total, at: time.Now()}
+	sm.diskFreeMu.Unlock()
+
 	return free, total, true
 }
 
