@@ -77,6 +77,34 @@ func (sm *ShareManager) DiskFree(shareName string) (free, total uint64, ok bool)
 	return free, total, true
 }
 
+// FullOSPath returns the absolute OS filesystem path for the given share-relative
+// path, guaranteed to remain under the share root. Use this to open a cached
+// *os.File at SMB2 CREATE time instead of opening and closing the file on every
+// READ/WRITE request.
+func (sm *ShareManager) FullOSPath(shareName, path string) (string, error) {
+	share, err := sm.GetShare(shareName)
+	if err != nil {
+		return "", err
+	}
+	shareRoot := filepath.Join(sm.basePath, share.Path)
+
+	cleanPath := filepath.Clean(path)
+	cleanPath = strings.TrimPrefix(cleanPath, "\\")
+	cleanPath = strings.TrimPrefix(cleanPath, "/")
+	cleanPath = strings.ReplaceAll(cleanPath, "\\", "/")
+	if cleanPath == "" || cleanPath == "." {
+		return shareRoot, nil
+	}
+
+	full := filepath.Join(shareRoot, cleanPath)
+	// Security: the resolved path must remain under the share root.
+	if !strings.HasPrefix(filepath.Clean(full)+string(filepath.Separator),
+		filepath.Clean(shareRoot)+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes share boundary: %s", path)
+	}
+	return full, nil
+}
+
 // getFsAndPath retrieves the filesystem and the relative path for a given share and path.
 // The path is cleaned and ensured to be valid for the filesystem.
 func (sm *ShareManager) getFsAndPath(shareName, path string) (afero.Fs, string, error) {

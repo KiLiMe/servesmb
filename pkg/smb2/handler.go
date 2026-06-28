@@ -2672,6 +2672,24 @@ func (h *SMB2Handler) handleCreate(msg *protocol.SMB2Message, connInfo hooks.Con
 		StreamName:     streamName,
 	}
 
+	// Cache an OS file descriptor for the duration of this SMB handle so that
+	// READ and WRITE use ReadAt/WriteAt on an already-open fd rather than
+	// opening and closing the file on every request. This is the primary fix
+	// for Time Machine sparsebundle performance (50+ open/close per write
+	// burst otherwise). Only for regular disk files; dirs, IPC pipes, and
+	// named streams use separate paths.
+	if !handle.IsDirectory && !treeConn.IsIPC && streamName == "" {
+		if fullPath, pathErr := h.shareManager.FullOSPath(treeConn.ShareName, fileName); pathErr == nil {
+			// Try read-write so both READ and WRITE share the same fd.
+			// Fall back to read-only for read-only shares or permission errors.
+			if f, openErr := os.OpenFile(fullPath, os.O_RDWR, 0); openErr == nil {
+				handle.OSFile = f
+			} else if f, openErr := os.OpenFile(fullPath, os.O_RDONLY, 0); openErr == nil {
+				handle.OSFile = f
+			}
+		}
+	}
+
 	h.fileHandles[string(fileID)] = handle
 
 	response := &protocol.SMB2Message{
@@ -2791,6 +2809,11 @@ func (h *SMB2Handler) handleClose(msg *protocol.SMB2Message, connInfo hooks.Conn
 	if exists {
 		if h.debug > 0 {
 			log.Printf("[DEBUG][SMB2] CLOSE: path=%q deleteOnClose=%v isDir=%v", handle.Path, (handle.CreateOptions&protocol.FILE_DELETE_ON_CLOSE) != 0, handle.IsDirectory)
+		}
+		// Close the cached OS fd before the handle is discarded.
+		if handle.OSFile != nil {
+			handle.OSFile.Close()
+			handle.OSFile = nil
 		}
 		if (handle.CreateOptions & protocol.FILE_DELETE_ON_CLOSE) != 0 {
 			if handle.StreamName != "" {
@@ -2917,9 +2940,23 @@ func (h *SMB2Handler) handleRead(msg *protocol.SMB2Message, connInfo hooks.ConnI
 		length = protocol.MAX_BUFFER_SIZE
 	}
 
-	// Read file data using ShareManager
-	fileData, err := h.shareManager.ReadFile(handle.TreeConnection.ShareName, handle.Path, int64(offset), int(length))
-	if err != nil {
+	// Read file data — use the cached fd (ReadAt) when available to avoid the
+	// per-request open+close overhead inside ShareManager.ReadFile.
+	var fileData []byte
+	var readErr error
+	if handle.OSFile != nil {
+		buf := make([]byte, int(length))
+		n, err := handle.OSFile.ReadAt(buf, int64(offset))
+		if n > 0 {
+			fileData = buf[:n]
+		}
+		if err != nil && err != io.EOF {
+			readErr = err
+		}
+	} else {
+		fileData, readErr = h.shareManager.ReadFile(handle.TreeConnection.ShareName, handle.Path, int64(offset), int(length))
+	}
+	if readErr != nil {
 		return h.createErrorResponse(msg, protocol.STATUS_ACCESS_DENIED), nil
 	}
 
@@ -3124,9 +3161,16 @@ func (h *SMB2Handler) handleWrite(msg *protocol.SMB2Message, connInfo hooks.Conn
 		return h.createErrorResponse(msg, protocol.STATUS_ACCESS_DENIED), nil
 	}
 
-	// Write data using ShareManager
-	bytesWritten, err := h.shareManager.WriteFile(handle.TreeConnection.ShareName, handle.Path, int64(offset), writeData)
-	if err != nil {
+	// Write data — use the cached fd (WriteAt) when available to avoid the
+	// per-request open+close overhead inside ShareManager.WriteFile.
+	var bytesWritten int
+	var writeErr error
+	if handle.OSFile != nil {
+		bytesWritten, writeErr = handle.OSFile.WriteAt(writeData, int64(offset))
+	} else {
+		bytesWritten, writeErr = h.shareManager.WriteFile(handle.TreeConnection.ShareName, handle.Path, int64(offset), writeData)
+	}
+	if writeErr != nil {
 		return h.createErrorResponse(msg, protocol.STATUS_ACCESS_DENIED), nil
 	}
 

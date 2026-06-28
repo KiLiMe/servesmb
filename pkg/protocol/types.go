@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"time"
 )
@@ -77,6 +78,13 @@ type FileHandle struct {
 	// unnamed/default data stream. Used by the Apple SMB extensions so macOS
 	// can read/write FinderInfo and resource forks needed for Time Machine.
 	StreamName string
+	// OSFile is a cached OS-level file descriptor for this handle. Opened once
+	// at CREATE time and held until CLOSE so that READ and WRITE requests can
+	// use ReadAt/WriteAt directly instead of opening and closing the file on
+	// every request (the latter is O(n) file-open syscalls for n writes to the
+	// same band file, which is the primary bottleneck for Time Machine backups).
+	// Nil for directories, IPC pipes, and named streams.
+	OSFile *os.File
 }
 
 // FileInfo represents file metadata
