@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
-	"os"
 	"strings"
 	"time"
 )
@@ -84,7 +83,11 @@ type FileHandle struct {
 	// every request (the latter is O(n) file-open syscalls for n writes to the
 	// same band file, which is the primary bottleneck for Time Machine backups).
 	// Nil for directories, IPC pipes, and named streams.
-	OSFile *os.File
+	OSFile interface {
+		io.ReaderAt
+		io.WriterAt
+		io.Closer
+	}
 }
 
 // FileInfo represents file metadata

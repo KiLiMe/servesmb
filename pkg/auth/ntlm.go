@@ -47,12 +47,13 @@ type userCred struct {
 }
 
 type NTLMAuthenticator struct {
-	users     map[string]userCred // username -> hashes
-	domain    string
-	server    string
-	challenge []byte
-	passwords map[string]string // plaintext passwords for NTLMv2 server auth
-	logHash   bool              // Log NTLMv2 hash components
+	users           map[string]userCred // username -> hashes
+	domain          string
+	server          string
+	challenge       []byte
+	staticChallenge []byte
+	passwords       map[string]string // plaintext passwords for NTLMv2 server auth
+	logHash         bool              // Log NTLMv2 hash components
 }
 
 func NewNTLMAuthenticator(domain, server string) *NTLMAuthenticator {
@@ -99,6 +100,7 @@ func (auth *NTLMAuthenticator) SetStaticChallenge(challengeHex string) {
 			&challenge[4], &challenge[5], &challenge[6], &challenge[7])
 		if err == nil {
 			auth.challenge = challenge
+			auth.staticChallenge = challenge
 			fmt.Printf("[+] Set Static Challenge: %x\n", auth.challenge)
 		} else {
 			fmt.Printf("[-] Failed to parse static challenge: %v\n", err)
@@ -112,6 +114,9 @@ func (auth *NTLMAuthenticator) LogHash() bool {
 }
 
 func (auth *NTLMAuthenticator) GetChallenge() []byte { return auth.challenge }
+
+// StaticChallenge returns the configured override, if any.
+func (auth *NTLMAuthenticator) StaticChallenge() []byte { return auth.staticChallenge }
 
 // GetNTHash returns the NTHash for a user, if present.
 func (auth *NTLMAuthenticator) GetNTHash(username string) []byte {

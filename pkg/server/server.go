@@ -330,6 +330,14 @@ func localIPv4s() []net.IP {
 }
 
 func (s *SMBServer) handleConnection(conn net.Conn) {
+	if err := s.ServeConn(conn); err != nil {
+		log.Printf("Error handling connection from %s: %v", conn.RemoteAddr(), err)
+	}
+}
+
+// ServeConn handles a TCP session from a caller-owned listener. It closes conn
+// when the session ends. SMB2/3 state belongs to this connection.
+func (s *SMBServer) ServeConn(conn net.Conn) error {
 	defer conn.Close()
 
 	// Set connection timeout
@@ -339,11 +347,8 @@ func (s *SMBServer) handleConnection(conn net.Conn) {
 	// connection so handlers can re-read the already consumed bytes.
 	protocolVersion, wrappedConn, err := s.detectProtocol(conn)
 	if err != nil {
-		log.Printf("Failed to detect protocol for %s: %v", conn.RemoteAddr(), err)
-		return
+		return err
 	}
-
-	log.Printf("Detected protocol %s for %s", protocolVersion, conn.RemoteAddr())
 
 	// Route to appropriate handler
 	var handler protocol.SMBHandler
@@ -351,25 +356,21 @@ func (s *SMBServer) handleConnection(conn net.Conn) {
 	switch protocolVersion {
 	case "SMB1":
 		if !s.config.EnableSMB1 || s.smb1Handler == nil {
-			log.Printf("SMB1 not enabled, rejecting connection from %s", conn.RemoteAddr())
-			return
+			return fmt.Errorf("SMB1 is disabled")
 		}
 		handler = s.smb1Handler
 	case "SMB2":
 		if !s.config.EnableSMB2 || s.smb2Handler == nil {
-			log.Printf("SMB2 not enabled, rejecting connection from %s", conn.RemoteAddr())
-			return
+			return fmt.Errorf("SMB2 is disabled")
 		}
-		handler = s.smb2Handler
+		handler = s.smb2Handler.NewConnectionHandler()
 	case "SMB3":
 		if !s.config.EnableSMB3 || s.smb3Handler == nil {
-			log.Printf("SMB3 not enabled, rejecting connection from %s", conn.RemoteAddr())
-			return
+			return fmt.Errorf("SMB3 is disabled")
 		}
-		handler = s.smb3Handler
+		handler = s.smb3Handler.NewConnectionHandler()
 	default:
-		log.Printf("Unsupported protocol %s from %s", protocolVersion, conn.RemoteAddr())
-		return
+		return fmt.Errorf("unsupported protocol %s", protocolVersion)
 	}
 
 	// Clear read deadline; let protocol handlers manage their own timeouts
@@ -379,13 +380,7 @@ func (s *SMBServer) handleConnection(conn net.Conn) {
 	if wrappedConn != nil {
 		conn = wrappedConn
 	}
-	err = handler.HandleConnection(conn)
-	if err != nil && err != io.EOF {
-		log.Printf("Error handling %s connection from %s: %v",
-			protocolVersion, conn.RemoteAddr(), err)
-	} else {
-		log.Printf("Connection from %s closed gracefully", conn.RemoteAddr())
-	}
+	return handler.HandleConnection(conn)
 }
 
 func (s *SMBServer) detectProtocol(conn net.Conn) (string, net.Conn, error) {
@@ -435,23 +430,28 @@ func (s *SMBServer) detectProtocol(conn net.Conn) (string, net.Conn, error) {
 	case protocol.SMB1_PROTOCOL_ID:
 		// Peek inside SMB1 negotiate to see if client proposes SMB2 dialects.
 		// SMB1 header is 32 bytes; dialect strings are in Data after Parameters.
-		if len(fullMessage) >= 36 {
-			// Search for ASCII substrings indicating SMB2-capable client
-			if bytes.Contains(fullMessage, []byte("SMB 2.002")) ||
-				bytes.Contains(fullMessage, []byte("SMB 2.1")) ||
-				bytes.Contains(fullMessage, []byte("SMB 3.")) {
+		if len(fullMessage) >= 39 && fullMessage[8] == 0x72 {
+			// The SMB1 NEGOTIATE dialect list starts after WordCount and ByteCount.
+			// Both modern dialect names have the 0x02 format marker.
+			dialects := fullMessage[39:]
+			if bytes.Contains(dialects, []byte("\x02SMB 2.002\x00")) ||
+				bytes.Contains(dialects, []byte("\x02SMB 2.???\x00")) {
 				// Reply with SMB2 NEGOTIATE. Use the handler that will
 				// actually process the connection so dialect state is shared.
 				if s.smb3Handler != nil {
 					resp := s.smb3Handler.BuildNegotiateResponseBytes()
 					if len(resp) > 0 {
-						conn.Write(resp)
+						if _, err := conn.Write(resp); err != nil {
+							return "", nil, err
+						}
 						return "SMB3", conn, nil
 					}
 				} else if s.smb2Handler != nil {
 					resp := s.smb2Handler.BuildNegotiateResponseBytes()
 					if len(resp) > 0 {
-						conn.Write(resp)
+						if _, err := conn.Write(resp); err != nil {
+							return "", nil, err
+						}
 						return "SMB2", conn, nil
 					}
 				}

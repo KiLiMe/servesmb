@@ -47,9 +47,9 @@ func NewServer(targetName, nbName, nbDomain, dnsName, dnsDomain string) *Server 
 	return &Server{targetName: targetName, nbName: nbName, nbDomain: nbDomain, dnsName: dnsName, dnsDomain: dnsDomain, accounts: make(map[string]string), hashes: make(map[string][]byte)}
 }
 
-func (s *Server) AddAccount(user, password string) { s.accounts[user] = password }
+func (s *Server) AddAccount(user, password string) { s.accounts[strings.ToLower(user)] = password }
 
-func (s *Server) AddAccountWithHash(user string, hash []byte) { s.hashes[user] = hash }
+func (s *Server) AddAccountWithHash(user string, hash []byte) { s.hashes[strings.ToLower(user)] = hash }
 
 func (s *Server) AllowGuest() { s.allowGuest = true }
 
@@ -144,7 +144,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 		return errors.New("invalid LM challenge format")
 	}
 	ntRespOff := le.Uint32(amsg[24:28])
-	if len(amsg) < int(ntRespOff+uint32(ntRespLen)) {
+	if uint64(ntRespOff)+uint64(ntRespLen) > uint64(len(amsg)) {
 		return errors.New("invalid LM challenge format")
 	}
 	ntResp := amsg[ntRespOff : ntRespOff+uint32(ntRespLen)]
@@ -155,7 +155,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 		return errors.New("invalid domain name format")
 	}
 	domOff := le.Uint32(amsg[32:36])
-	if len(amsg) < int(domOff+uint32(domLen)) {
+	if uint64(domOff)+uint64(domLen) > uint64(len(amsg)) {
 		return errors.New("invalid domain name format")
 	}
 	domainName := amsg[domOff : domOff+uint32(domLen)]
@@ -166,7 +166,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 		return errors.New("invalid user name format")
 	}
 	userOff := le.Uint32(amsg[40:44])
-	if len(amsg) < int(userOff+uint32(userLen)) {
+	if uint64(userOff)+uint64(userLen) > uint64(len(amsg)) {
 		return errors.New("invalid user name format")
 	}
 	userName := amsg[userOff : userOff+uint32(userLen)]
@@ -179,10 +179,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 		uName := utf16le.DecodeToString(userName)
 		dName := utf16le.DecodeToString(domainName)
 
-		ntRespExtract := []byte{}
-		if len(amsg) >= int(ntRespOff+uint32(ntRespLen)) {
-			ntRespExtract = amsg[ntRespOff : ntRespOff+uint32(ntRespLen)]
-		}
+		ntRespExtract := ntResp
 
 		// Server Challenge is in s.cmsg[24:32]
 		srvChall := []byte{}
@@ -210,7 +207,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 		return errors.New("invalid user name format")
 	}
 	encKeyOff := le.Uint32(amsg[56:60])
-	if len(amsg) < int(encKeyOff+uint32(encKeyLen)) {
+	if uint64(encKeyOff)+uint64(encKeyLen) > uint64(len(amsg)) {
 		return errors.New("invalid user name format")
 	}
 	encRandSessionKey := amsg[encKeyOff : encKeyOff+uint32(encKeyLen)]
@@ -255,7 +252,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 	}
 
 	if len(userName) != 0 || len(ntResp) != 0 {
-		user := decodedUser
+		user := strings.ToLower(decodedUser)
 		// Check both accounts (password) and hashes
 		_, hasPassword := s.accounts[user]
 		_, hasHash := s.hashes[user]
@@ -328,7 +325,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 		}
 		session := new(Session)
 		session.isClientSide = false
-		session.user = user
+		session.user = decodedUser
 		session.negotiateFlags = flags
 		// SessionBaseKey = HMAC_MD5(ResponseKeyNT, NTProofStr); from it derive
 		// the exported session key plus the signing/sealing keys. These back

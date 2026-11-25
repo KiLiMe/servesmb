@@ -165,6 +165,22 @@ func (sm *ShareManager) getFsAndPath(shareName, path string) (afero.Fs, string, 
 	return fs, cleanPath, nil
 }
 
+// OpenFile uses the registered filesystem for cached SMB handles too.
+func (sm *ShareManager) OpenFile(shareName, path string, flags int) (afero.File, error) {
+	share, err := sm.GetShare(shareName)
+	if err != nil {
+		return nil, err
+	}
+	if share.ReadOnly && flags != os.O_RDONLY {
+		return nil, os.ErrPermission
+	}
+	fs, cleanPath, err := sm.getFsAndPath(shareName, path)
+	if err != nil {
+		return nil, err
+	}
+	return fs.OpenFile(cleanPath, flags, 0)
+}
+
 func (sm *ShareManager) GetFileInfo(shareName, path string) (*protocol.FileInfo, error) {
 	fs, cleanPath, err := sm.getFsAndPath(shareName, path)
 	if err != nil {

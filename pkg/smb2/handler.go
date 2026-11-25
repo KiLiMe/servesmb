@@ -90,7 +90,7 @@ const hashSHA512 = 0x0001 // SMB2_PREAUTH_INTEGRITY_CAPABILITIES hash algorithm
 // connState holds per-connection negotiation state. A pointer is threaded
 // through the request dispatch so SMB 3.1.1 preauth integrity and the
 // negotiated cipher/signing algorithm survive from NEGOTIATE to SESSION_SETUP
-// without racing across connections (the handler instance is shared).
+// for this connection.
 type connState struct {
 	preauthHash [64]byte // SMB 3.1.1 preauth integrity running hash (SHA-512)
 	is311       bool     // SMB 3.1.1 negotiated
@@ -229,6 +229,14 @@ func NewSMB2Handler(shareManager *shares.ShareManager, authenticator *auth.NTLMA
 	binary.LittleEndian.PutUint64(h.serverGUID[:8], now)
 	binary.LittleEndian.PutUint64(h.serverGUID[8:], now^0xA5A5A5A5A5A5A5A5)
 	return h
+}
+
+// NewConnectionHandler creates independent session and file-handle tables
+// while preserving the identity and configuration of the server.
+func (h *SMB2Handler) NewConnectionHandler() *SMB2Handler {
+	conn := NewSMB2Handler(h.shareManager, h.authenticator, h.supportSMB3, h.debug, h.enableMIC, h.hooks)
+	conn.serverGUID = h.serverGUID
+	return conn
 }
 
 func (h *SMB2Handler) dbg(format string, args ...interface{}) {
@@ -374,6 +382,14 @@ func (h *SMB2Handler) encryptTransform(responseData []byte, session *protocol.Se
 
 func (h *SMB2Handler) HandleConnection(conn net.Conn) error {
 	defer conn.Close()
+	defer func() {
+		for id, handle := range h.fileHandles {
+			if handle.OSFile != nil {
+				handle.OSFile.Close()
+			}
+			delete(h.fileHandles, id)
+		}
+	}()
 
 	// Determine local IP for NTLM SPN generation
 	localAddr := conn.LocalAddr().String()
@@ -527,8 +543,12 @@ func (h *SMB2Handler) HandleConnection(conn net.Conn) error {
 			nbHeader[1] = byte((length >> 16) & 0xFF)
 			nbHeader[2] = byte((length >> 8) & 0xFF)
 			nbHeader[3] = byte(length & 0xFF)
-			conn.Write(nbHeader)
-			conn.Write(responseData)
+			if _, err := conn.Write(nbHeader); err != nil {
+				return err
+			}
+			if _, err := conn.Write(responseData); err != nil {
+				return err
+			}
 			for _, resp := range responses {
 				if resp.Header.Command == protocol.SMB2_LOGOFF && resp.Header.SessionID != 0 {
 					h.stateMu.Lock()
@@ -589,7 +609,7 @@ func (h *SMB2Handler) parseCompoundRequests(data []byte) ([]*protocol.SMB2Messag
 			msgLen = len(data) - offset
 		}
 
-		if offset+msgLen > len(data) {
+		if msgLen < 64 || msgLen > len(data)-offset {
 			return nil, fmt.Errorf("invalid NextCommand offset")
 		}
 
@@ -1430,10 +1450,8 @@ func (h *SMB2Handler) handleSessionSetup(msg *protocol.SMB2Message, connInfo hoo
 		}
 		h.dbg("DEBUG: NTLM target=%q nbName=%q nbDomain=%q dnsName=%q", serverName, serverName, serverName, dnsName)
 		nt := myntlm.NewServer(serverName, serverName, serverName, dnsName, "")
-		// Enable guest access for macOS compatibility
-		nt.AllowGuest()
 		nt.SetLogHash(h.authenticator.LogHash())
-		nt.SetStaticChallenge(h.authenticator.GetChallenge())
+		nt.SetStaticChallenge(h.authenticator.StaticChallenge())
 		nt.SetEnableMIC(h.enableMIC) // Set configured MIC behavior
 
 		// Add configured users from our authenticator
@@ -1548,6 +1566,11 @@ func (h *SMB2Handler) handleSessionSetup(msg *protocol.SMB2Message, connInfo hoo
 	}
 
 	if err := nt.Authenticate(ntlmAuth); err != nil {
+		delete(h.pendingNTLM, msg.Header.SessionID)
+		delete(h.pendingIsSPNEGO, msg.Header.SessionID)
+		delete(h.pendingMechList, msg.Header.SessionID)
+		delete(h.pendingDialect, msg.Header.SessionID)
+		h.hooks.OnLoginFailure(connInfo, "", "", "", err)
 		if h.debug > 0 {
 			h.dbg("SESSION_SETUP[leg2]: NTLM authenticate error: %v", err)
 		}
@@ -1563,7 +1586,7 @@ func (h *SMB2Handler) handleSessionSetup(msg *protocol.SMB2Message, connInfo hoo
 	// IPC$ null sessions (for example, some Windows RPC probes) see IS_NULL
 	// instead of IS_GUEST in the final SESSION_SETUP response.
 	isAnonymous := username == ""
-	isGuest := nt.Session().IsGuest() || strings.EqualFold(username, "GUEST")
+	isGuest := nt.Session().IsGuest()
 	session := &protocol.Session{
 		ID:              msg.Header.SessionID,
 		Username:        username,
@@ -2500,6 +2523,15 @@ func (h *SMB2Handler) handleCreate(msg *protocol.SMB2Message, connInfo hooks.Con
 		return response, nil
 	}
 
+	if h.isReadOnly(treeConn) {
+		if createOptions&protocol.FILE_DELETE_ON_CLOSE != 0 ||
+			(createDisposition != protocol.FILE_OPEN && createDisposition != protocol.FILE_OPEN_IF) ||
+			(createDisposition == protocol.FILE_OPEN_IF && !h.shareManager.FileExists(treeConn.ShareName, fileName)) {
+			return h.createErrorResponse(msg, protocol.STATUS_ACCESS_DENIED), nil
+		}
+		createDisposition = protocol.FILE_OPEN
+	}
+
 	// Handle creation based on disposition
 	var fileInfo *protocol.FileInfo
 	var createAction uint32
@@ -2679,14 +2711,10 @@ func (h *SMB2Handler) handleCreate(msg *protocol.SMB2Message, connInfo hooks.Con
 	// burst otherwise). Only for regular disk files; dirs, IPC pipes, and
 	// named streams use separate paths.
 	if !handle.IsDirectory && !treeConn.IsIPC && streamName == "" {
-		if fullPath, pathErr := h.shareManager.FullOSPath(treeConn.ShareName, fileName); pathErr == nil {
-			// Try read-write so both READ and WRITE share the same fd.
-			// Fall back to read-only for read-only shares or permission errors.
-			if f, openErr := os.OpenFile(fullPath, os.O_RDWR, 0); openErr == nil {
-				handle.OSFile = f
-			} else if f, openErr := os.OpenFile(fullPath, os.O_RDONLY, 0); openErr == nil {
-				handle.OSFile = f
-			}
+		if f, err := h.shareManager.OpenFile(treeConn.ShareName, fileName, os.O_RDWR); err == nil {
+			handle.OSFile = f
+		} else if f, err := h.shareManager.OpenFile(treeConn.ShareName, fileName, os.O_RDONLY); err == nil {
+			handle.OSFile = f
 		}
 	}
 
@@ -2960,39 +2988,11 @@ func (h *SMB2Handler) handleRead(msg *protocol.SMB2Message, connInfo hooks.ConnI
 		return h.createErrorResponse(msg, protocol.STATUS_ACCESS_DENIED), nil
 	}
 
-	response := &protocol.SMB2Message{
-		Header: protocol.SMB2Header{
-			ProtocolID:    [4]byte{0xFE, 'S', 'M', 'B'},
-			StructureSize: 64,
-			Status:        protocol.STATUS_SUCCESS,
-			Command:       protocol.SMB2_READ,
-			CreditRequest: h.creditsFor(msg),
-			Flags:         0x01,
-			MessageID:     msg.Header.MessageID,
-			TreeID:        msg.Header.TreeID,
-			SessionID:     msg.Header.SessionID,
-		},
+	if len(fileData) == 0 && length != 0 {
+		return h.createErrorResponse(msg, protocol.STATUS_END_OF_FILE), nil
 	}
-
-	data := bytes.NewBuffer(nil)
-	binary.Write(data, binary.LittleEndian, uint16(17))            // StructureSize
-	binary.Write(data, binary.LittleEndian, uint8(80))             // DataOffset
-	binary.Write(data, binary.LittleEndian, uint8(0))              // Reserved
-	binary.Write(data, binary.LittleEndian, uint32(len(fileData))) // DataLength
-	binary.Write(data, binary.LittleEndian, uint32(0))             // DataRemaining
-	binary.Write(data, binary.LittleEndian, uint32(0))             // Flags
-
-	// Add padding to reach DataOffset
-	for data.Len() < 80-64 { // 80 - header size
-		data.WriteByte(0)
-	}
-
-	data.Write(fileData) // File data
-
 	h.hooks.OnFileDownload(connInfo, handle.TreeConnection.ShareName, handle.Path, int64(len(fileData)))
-
-	response.Data = data.Bytes()
-	return response, nil
+	return h.buildSMB2ReadResponse(msg, fileID, fileData)
 }
 
 // buildSMB2ReadResponse builds an SMB2 READ response with the given data.
@@ -3109,6 +3109,10 @@ func (h *SMB2Handler) handleWrite(msg *protocol.SMB2Message, connInfo hooks.Conn
 		binary.Write(data, binary.LittleEndian, uint16(0))            // WriteChannelInfoLength
 		response.Data = data.Bytes()
 		return response, nil
+	}
+
+	if h.isReadOnly(handle.TreeConnection) {
+		return h.createErrorResponse(msg, protocol.STATUS_ACCESS_DENIED), nil
 	}
 
 	// Named-stream write (Apple FinderInfo / resource fork). Store in streamStore
@@ -4407,6 +4411,11 @@ func (h *SMB2Handler) handleDCERPC(input []byte) []byte {
 	return nil
 }
 
+func (h *SMB2Handler) isReadOnly(tree *protocol.TreeConnection) bool {
+	share, err := h.shareManager.GetShare(tree.ShareName)
+	return err != nil || share.ReadOnly
+}
+
 func (h *SMB2Handler) handleSetInfo(msg *protocol.SMB2Message, connInfo hooks.ConnInfo) (*protocol.SMB2Message, error) {
 	if len(msg.Data) < 33 {
 		return h.createErrorResponse(msg, protocol.STATUS_INVALID_PARAMETER), nil
@@ -4434,6 +4443,9 @@ func (h *SMB2Handler) handleSetInfo(msg *protocol.SMB2Message, connInfo hooks.Co
 	handle, exists := h.fileHandles[string(fileID)]
 	if !exists {
 		return h.createErrorResponse(msg, protocol.STATUS_INVALID_HANDLE), nil
+	}
+	if h.isReadOnly(handle.TreeConnection) {
+		return h.createErrorResponse(msg, protocol.STATUS_ACCESS_DENIED), nil
 	}
 	if h.debug > 0 {
 		log.Printf("[DEBUG][SMB2] SET_INFO: infoType=0x%02x class=0x%02x bufLen=%d path=%q isDir=%v", infoType, fileInfoClass, bufferLength, handle.Path, handle.IsDirectory)
@@ -4505,7 +4517,7 @@ func (h *SMB2Handler) handleSetInfo(msg *protocol.SMB2Message, connInfo hooks.Co
 		}
 		replaceIfExists := data[0] != 0
 		fileNameLength := binary.LittleEndian.Uint32(data[16:20])
-		if int(20+fileNameLength) > len(data) || fileNameLength%2 != 0 {
+		if uint64(fileNameLength) > uint64(len(data)-20) || fileNameLength%2 != 0 {
 			return h.createErrorResponse(msg, protocol.STATUS_INVALID_PARAMETER), nil
 		}
 
