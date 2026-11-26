@@ -2,12 +2,15 @@ package server
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/3xport/servesmb/pkg/auth"
@@ -20,6 +23,29 @@ import (
 	"github.com/3xport/servesmb/pkg/smb2"
 	"github.com/3xport/servesmb/pkg/smb3"
 )
+
+// ErrSMB1Disabled means the client's first frame only listed SMB1 dialects
+// while SMB1 file service is turned off. Callers use it to tell "the client is
+// too old" apart from transport failures.
+var ErrSMB1Disabled = errors.New("client only offers SMB1 and SMB1 is disabled")
+
+// SMB1DisabledError carries the dialects the client proposed, so callers can
+// name them in their own diagnostics. It matches ErrSMB1Disabled via errors.Is.
+type SMB1DisabledError struct {
+	Dialects []string
+}
+
+func (e *SMB1DisabledError) Error() string {
+	if len(e.Dialects) == 0 {
+		return ErrSMB1Disabled.Error()
+	}
+	return fmt.Sprintf("%s: %s", ErrSMB1Disabled, strings.Join(e.Dialects, ", "))
+}
+
+func (e *SMB1DisabledError) Is(target error) bool { return target == ErrSMB1Disabled }
+
+// DialectNames lists the dialects the client proposed, in the order it sent them.
+func (e *SMB1DisabledError) DialectNames() []string { return e.Dialects }
 
 type AuthConfig struct {
 	Password string
@@ -356,7 +382,7 @@ func (s *SMBServer) ServeConn(conn net.Conn) error {
 	switch protocolVersion {
 	case "SMB1":
 		if !s.config.EnableSMB1 || s.smb1Handler == nil {
-			return fmt.Errorf("SMB1 is disabled")
+			return ErrSMB1Disabled
 		}
 		handler = s.smb1Handler
 	case "SMB2":
@@ -388,7 +414,7 @@ func (s *SMBServer) detectProtocol(conn net.Conn) (string, net.Conn, error) {
 	nbHeader := make([]byte, 4)
 	_, err := io.ReadFull(conn, nbHeader)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to read NetBIOS header: %v", err)
+		return "", nil, fmt.Errorf("failed to read NetBIOS header: %w", err)
 	}
 
 	// Extract message length
@@ -401,14 +427,14 @@ func (s *SMBServer) detectProtocol(conn net.Conn) (string, net.Conn, error) {
 	protocolID := make([]byte, 4)
 	_, err = io.ReadFull(conn, protocolID)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to read protocol ID: %v", err)
+		return "", nil, fmt.Errorf("failed to read protocol ID: %w", err)
 	}
 
 	// Read rest of message to avoid breaking the stream
 	remaining := make([]byte, msgLen-4)
 	_, err = io.ReadFull(conn, remaining)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to read remaining message: %v", err)
+		return "", nil, fmt.Errorf("failed to read remaining message: %w", err)
 	}
 
 	// Reconstruct full message and create a new connection wrapper
@@ -456,6 +482,19 @@ func (s *SMBServer) detectProtocol(conn net.Conn) (string, net.Conn, error) {
 					}
 				}
 			}
+		}
+		if !s.config.EnableSMB1 || s.smb1Handler == nil {
+			// SMB1 file service is off. A pure SMB1 client would otherwise be
+			// left hanging until its own timeout (Windows reports the very
+			// unhelpful ERROR_BAD_NETPATH). Answer its NEGOTIATE with
+			// STATUS_NOT_SUPPORTED so it gives up immediately, and say which
+			// dialects it asked for.
+			if len(fullMessage) >= 33 && fullMessage[8] == protocol.SMB1_COM_NEGOTIATE {
+				if _, err := conn.Write(smb1Refusal(fullMessage[4:36])); err != nil {
+					return "", nil, err
+				}
+			}
+			return "", nil, &SMB1DisabledError{Dialects: smb1DialectNames(fullMessage)}
 		}
 		return "SMB1", bufferedConn, nil
 	case protocol.SMB2_PROTOCOL_ID:
@@ -535,4 +574,42 @@ func (s *SMBServer) GetStats() map[string]interface{} {
 	stats["user_count"] = len(s.config.Users)
 
 	return stats
+}
+
+// smb1Refusal builds the SMB1 NEGOTIATE answer used when SMB1 file service is
+// off: the client's own header (so it can match MID/TID/PID/UID) with
+// STATUS_NOT_SUPPORTED, SMB_FLAGS_SERVER_TO_REDIR set, WordCount=0 and
+// ByteCount=0 — i.e. no dialect agreed. Without this the connection is simply
+// closed and Windows reports error 53 (ERROR_BAD_NETPATH) after a timeout.
+func smb1Refusal(request []byte) []byte {
+	msg := make([]byte, 32)
+	copy(msg, request)
+	copy(msg[0:4], protocol.SMB1_PROTOCOL_ID)
+	binary.LittleEndian.PutUint32(msg[5:9], protocol.STATUS_NOT_SUPPORTED)
+	msg[9] |= 0x80             // SMB_FLAGS_SERVER_TO_REDIR
+	msg = append(msg, 0, 0, 0) // WordCount = 0, ByteCount = 0
+
+	frame := make([]byte, 4, 4+len(msg))
+	frame[1] = byte(len(msg) >> 16)
+	frame[2] = byte(len(msg) >> 8)
+	frame[3] = byte(len(msg))
+	return append(frame, msg...)
+}
+
+// smb1DialectNames lists the dialects an SMB1 NEGOTIATE request proposed, so
+// the caller's log can say what the client can actually speak. The list is a
+// buffer of <0x02><name><NUL> entries, not a WORD array; it starts after the
+// NBSS header (4), the SMB1 header (32), WordCount (1) and ByteCount (2).
+func smb1DialectNames(fullMessage []byte) []string {
+	if len(fullMessage) < 39 || fullMessage[8] != protocol.SMB1_COM_NEGOTIATE {
+		return nil
+	}
+	var names []string
+	for _, entry := range bytes.Split(fullMessage[39:], []byte{0}) {
+		if len(entry) == 0 || entry[0] != 0x02 {
+			continue
+		}
+		names = append(names, string(entry[1:]))
+	}
+	return names
 }
