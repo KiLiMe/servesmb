@@ -10,11 +10,16 @@ const (
 	BlockSize = 16
 )
 
+// cmac 是 AES-CMAC（RFC 4493）。原来是「先把整条报文 append 进 buf，再逐块
+// 从 buf 里切片」——每个 SMB 应答 1 MiB，那一次 append 就是多拷一份，逐块
+// 处理还要再走一遍切片与 16 字节循环异或。这里改成直接扫调用者的 p，异或用
+// 两个 64 位字，状态放定长数组。行为与 RFC 4493 一致。
 type cmac struct {
-	k1, k2 []byte
+	k1, k2 [BlockSize]byte
 	block  cipher.Block
-	x      []byte
-	buf    []byte
+	x      [BlockSize]byte
+	buf    [BlockSize]byte
+	nbuf   int
 }
 
 // New returns a new CMAC-AES-128 hash using the given cipher.Block.
@@ -25,147 +30,117 @@ func New(c cipher.Block) hash.Hash {
 
 	k1, k2 := generateSubkeys(c)
 
-	return &cmac{
-		k1:    k1,
-		k2:    k2,
-		block: c,
-		x:     make([]byte, BlockSize),
-		buf:   make([]byte, 0, BlockSize),
-	}
+	return &cmac{k1: k1, k2: k2, block: c}
 }
 
 func (d *cmac) Write(p []byte) (nn int, err error) {
 	nn = len(p)
-	d.buf = append(d.buf, p...)
 
-	// Process complete blocks only if we have MORE than one block buffered.
-	// We must reserve the last block (or partial block) for Sum() because logic differs.
-	// Actually, we process full blocks immediately, but we must keep at least one byte?
-	// No, we process all complete blocks except the very last one potentially?
-	// Standard strategy: buffer. If buffer >= BlockSize, process (buffer - remainder).
-	// But we don't know if this is the last write.
-	// We MUST always keep at least a potential partial block?
-	//
-	// No, checking standard implementations:
-	// Process as many full blocks as possible, but if input is exactly multiple of block size,
-	// we still don't know if there is more data coming.
-	// Wait, Sum() is called at the end.
-
-	for len(d.buf) > BlockSize {
-		// Process one block
-		xor(d.x, d.buf[:BlockSize])
-		d.block.Encrypt(d.x, d.x)
-		d.buf = d.buf[BlockSize:]
+	// 先把上次剩下的半块凑满
+	if d.nbuf > 0 {
+		need := BlockSize - d.nbuf
+		// 正好凑满也不急着算：它可能就是最后一块，得留给 Sum 决定要不要异或 K1。
+		if len(p) <= need {
+			d.nbuf += copy(d.buf[d.nbuf:], p)
+			return nn, nil
+		}
+		copy(d.buf[d.nbuf:], p[:need])
+		d.processBlock(d.buf[:])
+		d.nbuf = 0
+		p = p[need:]
 	}
-	// Post-condition: len(d.buf) <= BlockSize
-	// But we might have processed the "last" block if stream ended here?
-	// If stream ends, d.buf is the last block (could be full or partial).
-	// If d.buf is FULL block (16 bytes), and we call Sum():
-	// It treats it as a complete block (xor k1).
-	// If d.buf is PARTIAL (or empty), it treats as incomplete (padding + xor k2).
 
-	// Issue: If we have exactly 16 bytes in buf, and Write comes with 0 bytes (eof?),
-	// effectively we finish.
-	// If Write comes with more bytes, the 16 bytes in buf were NOT the last block.
-	// So we can safely process blocks as long as we leave SOMETHING in buffer?
-	// Or we just buffer everything? No, inefficient.
-	// The standard way: Only process `len(buf) / BlockSize` blocks?
-	// We need to keep the "leftover".
-	// If `len(buf) > BlockSize`, we can process `len(buf) - BlockSize`?
-	// To ensure we always have the potential last chunk in `buf`.
-	// Simple approach:
+	// 中间整块直接扫入参，不落缓冲；最后一块（可能正好整块）留在 buf 里等 Sum
+	for len(p) > BlockSize {
+		d.processBlock(p[:BlockSize])
+		p = p[BlockSize:]
+	}
+	d.nbuf = copy(d.buf[:], p)
 
 	return nn, nil
 }
 
+// processBlock 做 x = E(x XOR block)。
+func (d *cmac) processBlock(b []byte) {
+	xorBlock(&d.x, b)
+	d.block.Encrypt(d.x[:], d.x[:])
+}
+
 func (d *cmac) Sum(in []byte) []byte {
-	// Make a copy of state to verify without modifying
-	// But Sum usually appends to `in` and returns.
-	// We need to finish calculation.
-	// Copy D state?
-	// For SMB signing, we usually discard the hasher after Sum.
-	// But hash.Hash says Sum "does not change the underlying state".
-	// So we need to copy.
+	x := d.x // 拷一份：Sum 不许动状态
 
-	x := make([]byte, BlockSize)
-	copy(x, d.x)
-
-	// Last block logic
-	lastBlock := make([]byte, BlockSize)
-
-	// If buf is full block (16 bytes) -> It's a complete last block?
-	// RFC 4493: "If Mn* is a complete block... XOR K1"
-	// "If Mn* is incomplete... Padding... XOR K2"
-	// Wait. If input length was 0?
-	// Then n=1, incomplete (consisting of padding).
-
-	// How do we know if "buf" is complete?
-	// If len(buf) == 16, it is complete.
-	// IF len(buf) < 16, it is incomplete.
-
-	if len(d.buf) == BlockSize {
-		copy(lastBlock, d.buf)
-		xor(lastBlock, d.k1)
+	var lastBlock [BlockSize]byte
+	copy(lastBlock[:], d.buf[:d.nbuf]) // 尾巴必须是 0：buf 是定长数组，会留上一块的残渣
+	if d.nbuf == BlockSize {
+		xorBlock(&lastBlock, d.k1[:])
 	} else {
-		copy(lastBlock, d.buf)
-		lastBlock[len(d.buf)] = 0x80 // Padding
-		xor(lastBlock, d.k2)
+		lastBlock[d.nbuf] = 0x80 // 填充
+		xorBlock(&lastBlock, d.k2[:])
 	}
 
-	xor(x, lastBlock)
-	d.block.Encrypt(x, x)
+	xorBlock(&x, lastBlock[:])
+	d.block.Encrypt(x[:], x[:])
 
-	return append(in, x...)
+	return append(in, x[:]...)
 }
 
 func (d *cmac) Reset() {
-	d.x = make([]byte, BlockSize)
-	d.buf = make([]byte, 0, BlockSize)
+	d.x = [BlockSize]byte{}
+	d.buf = [BlockSize]byte{}
+	d.nbuf = 0
 }
 
-func (d *cmac) Size() int {
-	return BlockSize
-}
+func (d *cmac) Size() int { return BlockSize }
 
-func (d *cmac) BlockSize() int {
-	return BlockSize
-}
+func (d *cmac) BlockSize() int { return BlockSize }
 
 // generateSubkeys derived from RFC 4493
-func generateSubkeys(block cipher.Block) ([]byte, []byte) {
-	const rb = 0x87
+func generateSubkeys(block cipher.Block) (k1, k2 [BlockSize]byte) {
+	var l [BlockSize]byte
+	block.Encrypt(l[:], l[:])
 
-	l := make([]byte, BlockSize)
-	block.Encrypt(l, make([]byte, BlockSize))
-
-	k1 := make([]byte, BlockSize)
-	shiftLeft(k1, l)
+	shiftLeft(&k1, l[:])
 	if l[0]&0x80 != 0 {
-		k1[BlockSize-1] ^= rb
+		k1[BlockSize-1] ^= 0x87
 	}
-
-	k2 := make([]byte, BlockSize)
-	shiftLeft(k2, k1)
+	shiftLeft(&k2, k1[:])
 	if k1[0]&0x80 != 0 {
-		k2[BlockSize-1] ^= rb
+		k2[BlockSize-1] ^= 0x87
 	}
-
 	return k1, k2
 }
 
-func shiftLeft(dst, src []byte) {
+func shiftLeft(dst *[BlockSize]byte, src []byte) {
 	var overflow byte
-	for i := len(src) - 1; i >= 0; i-- {
+	for i := BlockSize - 1; i >= 0; i-- {
 		b := src[i]
 		dst[i] = (b << 1) | overflow
 		overflow = (b & 0x80) >> 7
 	}
 }
 
-func xor(dst, src []byte) {
-	for i := 0; i < len(dst); i++ {
-		dst[i] ^= src[i]
-	}
+// xorBlock 按两个 64 位字异或：16 字节循环在热路径上要跑 65536 次/MiB。
+func xorBlock(dst *[BlockSize]byte, src []byte) {
+	d0 := le64(dst[0:8]) ^ le64(src[0:8])
+	d1 := le64(dst[8:16]) ^ le64(src[8:16])
+	put64(dst[0:8], d0)
+	put64(dst[8:16], d1)
+}
+
+func le64(b []byte) uint64 {
+	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
+		uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
+}
+
+func put64(b []byte, v uint64) {
+	b[0] = byte(v)
+	b[1] = byte(v >> 8)
+	b[2] = byte(v >> 16)
+	b[3] = byte(v >> 24)
+	b[4] = byte(v >> 32)
+	b[5] = byte(v >> 40)
+	b[6] = byte(v >> 48)
+	b[7] = byte(v >> 56)
 }
 
 // One-shot
