@@ -61,6 +61,45 @@ type SMB2Handler struct {
 	stateMu     sync.RWMutex
 }
 
+// READ 应答的线格式偏移：64 字节 SMB2 头 + 16 字节应答体，数据从 80 起。
+// （SMB2 READ Response 的 DataOffset 字段规定为 80。）
+const (
+	smb2HeaderSize   = 64
+	readRespBodySize = 16
+	readDataOffset   = smb2HeaderSize + readRespBodySize
+)
+
+// readPool 攒的是「80 + MaxReadSize」一整块缓冲，READ 应答直接在它上面拼，
+// 写出去之后还回来。不池化的话每个 1 MiB 应答都要 make 一次（清零）再拷两次。
+var readPool = sync.Pool{New: func() any {
+	b := make([]byte, readDataOffset+protocol.MAX_TRANSACT_SIZE)
+	return &b
+}}
+
+// getReadBuf 借一块够放 n 字节数据的缓冲，返回缓冲与归还函数。
+// n 不是正数、或超过上限时返回 nil，调用方退回老路径——零长度读的老路径
+// 回的是空数据应答，快路给不出这个语义，就不接手。
+func getReadBuf(n int) ([]byte, func()) {
+	pb := readPool.Get().(*[]byte)
+	b := *pb
+	if n <= 0 || readDataOffset+n > len(b) {
+		readPool.Put(pb)
+		return nil, nil
+	}
+	return b[:readDataOffset+n], func() { readPool.Put(pb) }
+}
+
+// releaseResponses 把快路借来的缓冲还给池子。写出去之后再调，
+// 漏调只是多一次分配，不会错。
+func releaseResponses(resps []*protocol.SMB2Message) {
+	for _, r := range resps {
+		if r.Release != nil {
+			r.Release()
+			r.Release = nil
+		}
+	}
+}
+
 // SMB 3.1.1 negotiate context types (MS-SMB2 2.2.3.1).
 const (
 	negCtxPreauthIntegrity = 0x0001
@@ -510,6 +549,7 @@ func (h *SMB2Handler) HandleConnection(conn net.Conn) error {
 			responseData, err := h.marshalCompoundResponses(responses, session)
 			if err != nil {
 				log.Printf("Failed to marshal responses: %v", err)
+				releaseResponses(responses)
 				continue
 			}
 
@@ -532,6 +572,7 @@ func (h *SMB2Handler) HandleConnection(conn net.Conn) error {
 				encrypted, err := h.encryptTransform(responseData, session)
 				if err != nil {
 					log.Printf("Failed to encrypt response: %v", err)
+					releaseResponses(responses)
 					continue
 				}
 				responseData = encrypted
@@ -545,11 +586,15 @@ func (h *SMB2Handler) HandleConnection(conn net.Conn) error {
 			nbHeader[2] = byte((length >> 8) & 0xFF)
 			nbHeader[3] = byte(length & 0xFF)
 			if _, err := conn.Write(nbHeader); err != nil {
+				releaseResponses(responses)
 				return err
 			}
 			if _, err := conn.Write(responseData); err != nil {
+				releaseResponses(responses)
 				return err
 			}
+			// 报文已经写出去，池化的缓冲可以还了。
+			releaseResponses(responses)
 			for _, resp := range responses {
 				if resp.Header.Command == protocol.SMB2_LOGOFF && resp.Header.SessionID != 0 {
 					h.stateMu.Lock()
@@ -717,9 +762,13 @@ func (h *SMB2Handler) processCompoundRequests(reqs []*protocol.SMB2Message, conn
 func (h *SMB2Handler) marshalCompoundResponses(resps []*protocol.SMB2Message, session *protocol.Session) ([]byte, error) {
 	var buf bytes.Buffer
 
-	// Marshal all
+	// Marshal all（Prebuilt 的报文已经是线格式，不再经过 Marshal 复制）
 	var marshaled [][]byte
 	for _, r := range resps {
+		if r.Prebuilt != nil {
+			marshaled = append(marshaled, r.Prebuilt)
+			continue
+		}
 		b, err := r.Marshal()
 		if err != nil {
 			return nil, err
@@ -727,8 +776,16 @@ func (h *SMB2Handler) marshalCompoundResponses(resps []*protocol.SMB2Message, se
 		marshaled = append(marshaled, b)
 	}
 
+	// 单条应答（日常的 READ/WRITE 都是）不必再汇总拷一遍：它本身就是最终报文，
+	// 签名也直接签在同一块缓冲上。compound 才需要拼。
+	var single []byte
+	if len(marshaled) == 1 {
+		binary.LittleEndian.PutUint32(marshaled[0][20:24], 0) // NextCommand = 0
+		single = marshaled[0]
+	}
+
 	// Concat and set NextCommand
-	for i := 0; i < len(marshaled); i++ {
+	for i := 0; i < len(marshaled) && single == nil; i++ {
 		isLast := (i == len(marshaled)-1)
 
 		// Align to 8 bytes if not last
@@ -765,6 +822,9 @@ func (h *SMB2Handler) marshalCompoundResponses(resps []*protocol.SMB2Message, se
 	// But `marshalCompoundResponses` creates a new buffer.
 
 	finalData := buf.Bytes()
+	if single != nil {
+		finalData = single
+	}
 
 	// Sign responses for any session that established a real session key,
 	// including guest (the client derives the same key from the guest account's
@@ -2979,6 +3039,23 @@ func (h *SMB2Handler) handleRead(msg *protocol.SMB2Message, connInfo hooks.ConnI
 	var fileData []byte
 	var readErr error
 	if handle.OSFile != nil {
+		// 快路：直接把文件读进最终报文那一块缓冲，应答头也在这块上拼好。
+		// 老路径一 MiB 要搬四遍（make+ReadAt、Buffer.Write、Marshal、compound 汇总）。
+		if wire, release := getReadBuf(int(length)); wire != nil {
+			n, err := handle.OSFile.ReadAt(wire[readDataOffset:], int64(offset))
+			if err != nil && err != io.EOF {
+				release()
+				return h.createErrorResponse(msg, protocol.STATUS_ACCESS_DENIED), nil
+			}
+			if n == 0 {
+				release()
+				return h.createErrorResponse(msg, protocol.STATUS_END_OF_FILE), nil
+			}
+			resp := h.newFastReadResponse(msg, wire, n)
+			resp.Release = release
+			h.hooks.OnFileDownload(connInfo, handle.TreeConnection.ShareName, handle.Path, int64(n))
+			return resp, nil
+		}
 		buf := make([]byte, int(length))
 		n, err := handle.OSFile.ReadAt(buf, int64(offset))
 		if n > 0 {
@@ -2999,6 +3076,52 @@ func (h *SMB2Handler) handleRead(msg *protocol.SMB2Message, connInfo hooks.ConnI
 	}
 	h.hooks.OnFileDownload(connInfo, handle.TreeConnection.ShareName, handle.Path, int64(len(fileData)))
 	return h.buildSMB2ReadResponse(msg, fileID, fileData)
+}
+
+// newFastReadResponse 在 wire（80 字节头 + n 字节数据，数据已经读好）之上
+// 拼出一条 READ 应答。与 buildSMB2ReadResponse 逐字段等价，只是不再复制数据：
+// Data 指向同一块缓冲的 64.. 位置，Prebuilt 给出整条报文的切片。
+func (h *SMB2Handler) newFastReadResponse(req *protocol.SMB2Message, wire []byte, n int) *protocol.SMB2Message {
+	buf := wire[:readDataOffset+n]
+
+	// SMB2 头
+	copy(buf[0:4], []byte{0xFE, 'S', 'M', 'B'})
+	binary.LittleEndian.PutUint16(buf[4:6], 64)                       // StructureSize
+	binary.LittleEndian.PutUint16(buf[6:8], 0)                        // CreditCharge
+	binary.LittleEndian.PutUint32(buf[8:12], protocol.STATUS_SUCCESS) // Status
+	binary.LittleEndian.PutUint16(buf[12:14], protocol.SMB2_READ)     // Command
+	binary.LittleEndian.PutUint16(buf[14:16], h.creditsFor(req))      // CreditRequest
+	binary.LittleEndian.PutUint32(buf[16:20], 0x01)                   // Flags: SERVER_TO_REDIR
+	binary.LittleEndian.PutUint32(buf[20:24], 0)                      // NextCommand
+	binary.LittleEndian.PutUint64(buf[24:32], req.Header.MessageID)   // MessageID
+	binary.LittleEndian.PutUint32(buf[32:36], req.Header.ProcessID)   // ProcessID
+	binary.LittleEndian.PutUint32(buf[36:40], req.Header.TreeID)      // TreeID
+	binary.LittleEndian.PutUint64(buf[40:48], req.Header.SessionID)   // SessionID
+	clear(buf[48:64])                                                 // Signature（签名阶段再填）
+
+	// READ 应答体
+	binary.LittleEndian.PutUint16(buf[64:66], 17)        // StructureSize
+	buf[66] = uint8(readDataOffset)                      // DataOffset
+	buf[67] = 0                                          // Reserved
+	binary.LittleEndian.PutUint32(buf[68:72], uint32(n)) // DataLength
+	binary.LittleEndian.PutUint32(buf[72:76], 0)         // DataRemaining
+	binary.LittleEndian.PutUint32(buf[76:80], 0)         // Flags
+
+	return &protocol.SMB2Message{
+		Header: protocol.SMB2Header{
+			ProtocolID:    [4]byte{0xFE, 'S', 'M', 'B'},
+			StructureSize: 64,
+			Status:        protocol.STATUS_SUCCESS,
+			Command:       protocol.SMB2_READ,
+			CreditRequest: h.creditsFor(req),
+			Flags:         0x01,
+			MessageID:     req.Header.MessageID,
+			TreeID:        req.Header.TreeID,
+			SessionID:     req.Header.SessionID,
+		},
+		Data:     buf[smb2HeaderSize:],
+		Prebuilt: buf,
+	}
 }
 
 // buildSMB2ReadResponse builds an SMB2 READ response with the given data.

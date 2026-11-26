@@ -259,6 +259,17 @@ type SMB2Message struct {
 	Header SMB2Header
 	Data   []byte
 	Raw    []byte // Original raw message for signature verification
+
+	// Prebuilt is a PDU already laid out in wire format (64-byte SMB2 header
+	// included). READ responses fill it directly while reading the file, so the
+	// payload is never copied into Data and then copied again by Marshal.
+	// When set, Marshal is not called for this message.
+	Prebuilt []byte
+
+	// Release returns the buffer behind Prebuilt to the pool. The connection
+	// loop calls it after the response has been written (nil when Prebuilt is
+	// nil or the buffer is not pooled).
+	Release func()
 }
 
 func (m *SMB2Message) Marshal() ([]byte, error) {
