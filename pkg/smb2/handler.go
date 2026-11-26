@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/3xport/servesmb/pkg/auth"
 	"github.com/3xport/servesmb/pkg/crypto/ccm"
@@ -2092,12 +2093,17 @@ const (
 )
 
 // encodeUTF16LE encodes a string as UTF-16LE bytes (no BOM, no terminator).
+//
+// 全仓唯一的名字编码入口。以前有几处手写 `make([]byte, len(s)*2)` 再
+// `for i, r := range s`：range 给的是**字节**偏移，被当成 UTF-16 单元下标，
+// 于是每个非 ASCII 字符后面多出一串 0x0000，客户端读名字遇到第一个 NUL 就停，
+// 中文名只剩第一个字。别名一律走这里，别再手写。
 func encodeUTF16LE(s string) []byte {
-	r := []rune(s)
-	out := make([]byte, 0, len(r)*2)
-	for _, c := range r {
+	u := utf16.Encode([]rune(s))
+	out := make([]byte, 0, len(u)*2)
+	for _, c := range u {
 		var b [2]byte
-		binary.LittleEndian.PutUint16(b[:], uint16(c))
+		binary.LittleEndian.PutUint16(b[:], c)
 		out = append(out, b[:]...)
 	}
 	return out
@@ -3319,14 +3325,9 @@ func (h *SMB2Handler) handleQueryDirectory(msg *protocol.SMB2Message, connInfo h
 	}
 	outputStart := data.Len()
 
-	// Helper to encode filename to UTF-16LE
-	toUTF16 := func(s string) []byte {
-		b := make([]byte, len(s)*2)
-		for i, r := range s {
-			binary.LittleEndian.PutUint16(b[i*2:], uint16(r))
-		}
-		return b
-	}
+	// Helper to encode filename to UTF-16LE（见 encodeUTF16LE 的说明：
+	// 手写版本会把中文名截成第一个字）。
+	toUTF16 := encodeUTF16LE
 
 	// Convert Go time to Windows FILETIME (100ns intervals since Jan 1, 1601)
 	toFILETIME := func(t time.Time) uint64 {
@@ -3611,10 +3612,7 @@ func (h *SMB2Handler) handleQueryInfo(msg *protocol.SMB2Message, connInfo hooks.
 			if nm == "" {
 				nm = handle.FileInfo.Name
 			}
-			nm16 := make([]byte, len(nm)*2)
-			for i, r := range nm {
-				binary.LittleEndian.PutUint16(nm16[i*2:], uint16(r))
-			}
+			nm16 := encodeUTF16LE(nm)
 			binary.Write(body, binary.LittleEndian, uint32(len(nm16)))
 			body.Write(nm16)
 			for body.Len()%8 != 0 {
@@ -3651,10 +3649,7 @@ func (h *SMB2Handler) handleQueryInfo(msg *protocol.SMB2Message, connInfo hooks.
 			if name == "" {
 				name = handle.FileInfo.Name
 			}
-			name16 := make([]byte, len(name)*2)
-			for i, r := range name {
-				binary.LittleEndian.PutUint16(name16[i*2:], uint16(r))
-			}
+			name16 := encodeUTF16LE(name)
 			binary.Write(body, binary.LittleEndian, uint32(len(name16)))
 			body.Write(name16)
 			for body.Len()%8 != 0 {
@@ -3715,10 +3710,7 @@ func (h *SMB2Handler) handleQueryInfo(msg *protocol.SMB2Message, connInfo hooks.
 			binary.Write(body, binary.LittleEndian, now)       // VolumeCreationTime
 			binary.Write(body, binary.LittleEndian, uint32(0)) // VolumeSerialNumber
 			volName := "PUBLIC"
-			vol16 := make([]byte, len(volName)*2)
-			for i, r := range volName {
-				binary.LittleEndian.PutUint16(vol16[i*2:], uint16(r))
-			}
+			vol16 := encodeUTF16LE(volName)
 			binary.Write(body, binary.LittleEndian, uint32(len(vol16))) // VolumeLabelLength
 			body.WriteByte(0)                                           // SupportsObjects
 			body.WriteByte(0)                                           // Reserved
@@ -3766,10 +3758,7 @@ func (h *SMB2Handler) handleQueryInfo(msg *protocol.SMB2Message, connInfo hooks.
 			binary.Write(body, binary.LittleEndian, uint32(255)) // Max name length
 			fsName := "NTFS"
 			// length in bytes of UTF-16LE name
-			fs16 := make([]byte, len(fsName)*2)
-			for i, r := range fsName {
-				binary.LittleEndian.PutUint16(fs16[i*2:], uint16(r))
-			}
+			fs16 := encodeUTF16LE(fsName)
 			binary.Write(body, binary.LittleEndian, uint32(len(fs16)))
 			body.Write(fs16)
 			// align to 8
